@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import io
 from typing import Iterable
 
 from telegram import Update
@@ -91,6 +92,35 @@ def _format_result(url: str, r: dict) -> str:
 def _is_detected_gateway(r: dict) -> bool:
     return r.get("gateway") not in ("None Detected", "Generic / Private Gate 💳")
 
+def _split_gateways(gateway_str: str) -> list[str]:
+    """
+    analyzer returns a string like: "Stripe 💳, PayPal 💳"
+    Normalize into ["Stripe", "PayPal"].
+    """
+    s = (gateway_str or "").replace("💳", "").strip()
+    if not s or s == "None Detected":
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    return [p for p in parts if p]
+
+
+def _build_summary(scans: list[tuple[str, dict]]) -> str:
+    total = len(scans)
+    detected = sum(1 for _, r in scans if _is_detected_gateway(r))
+    skipped = total - detected
+    return f"Total checked: {total} | Detected: {detected} | Skipped: {skipped}"
+
+
+async def _edit_or_reply(msg, text: str):
+    # msg is a telegram.Message returned by reply_text()
+    try:
+        await msg.edit_text(text, disable_web_page_preview=True)
+    except Exception:
+        try:
+            await msg.reply_text(text, disable_web_page_preview=True)
+        except Exception:
+            return
+
 
 async def _reply_in_chunks(update: Update, text: str):
     if not update.message:
@@ -112,6 +142,35 @@ async def _reply_in_chunks(update: Update, text: str):
     for p in parts:
         await update.message.reply_text(p, disable_web_page_preview=True)
 
+async def _scan_urls_stream(
+    urls: list[str],
+    analyzer: SiteAnalyzer,
+    on_result,
+) -> list[tuple[str, dict]]:
+    """
+    Scan urls concurrently, but yield each result immediately via callback.
+    """
+    sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+    results: list[tuple[str, dict]] = []
+
+    async def one(u: str):
+        async with sem:
+            try:
+                r = await analyzer.analyze_site(u, proxy=PROXY)
+            except Exception as e:
+                r = {"status": f"Error: {e}", "gateway": "None Detected", "security": "None Detected"}
+            return (u, r)
+
+    tasks = [asyncio.create_task(one(u)) for u in urls]
+    for fut in asyncio.as_completed(tasks):
+        u, r = await fut
+        results.append((u, r))
+        try:
+            await on_result(u, r)
+        except Exception:
+            pass
+    return results
+
 
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -132,15 +191,55 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No URLs found in file.")
             return
 
-        await update.message.reply_text(f"Found {len(urls)} sites. Scanning with 20 threads...")
-        scans = await _scan_urls(urls, analyzer)
+        status_msg = await update.message.reply_text(
+            f"Checking {len(urls)} sites… (20 threads)",
+            disable_web_page_preview=True,
+        )
+
+        # For file uploads: send instant per-site results (one-by-one)
+        gateway_counts: dict[str, int] = {}
+        unsecured_rows: list[str] = []
+
+        async def on_result(u: str, r: dict):
+            gw = r.get("gateway", "None Detected")
+            await update.message.reply_text(f"✅ Checked: {u} -> [{gw}]", disable_web_page_preview=True)
+
+            # Only count "unsecured": no security detected
+            if r.get("security", "None Detected") != "None Detected":
+                return
+
+            # Only count real gateways (skip None/Generic)
+            if not _is_detected_gateway(r):
+                return
+
+            for name in _split_gateways(gw):
+                gateway_counts[name] = gateway_counts.get(name, 0) + 1
+            unsecured_rows.append(f"{u}\t{gw}\tsecurity=None Detected")
+
+        scans = await _scan_urls_stream(urls, analyzer, on_result=on_result)
         detected = [(u, r) for (u, r) in scans if _is_detected_gateway(r)]
+        summary = _build_summary(scans)
         if not detected:
-            await update.message.reply_text("No gateways detected in this file.")
+            await _edit_or_reply(status_msg, f"{summary}\n\nNo gateways detected in this file.")
             return
 
-        msg = "\n\n".join(_format_result(u, r) for u, r in detected)
-        await _reply_in_chunks(update, msg)
+        # After full file checked: send a counts file for "unsecured" only
+        if gateway_counts:
+            lines = []
+            lines.append("Unsecured gateway counts (security == None Detected)")
+            lines.append("")
+            for k in sorted(gateway_counts.keys()):
+                lines.append(f"{k}\t{gateway_counts[k]}")
+            lines.append("")
+            lines.append("Unsecured sites (url, gateway, security):")
+            lines.extend(unsecured_rows[:2000])
+            data = "\n".join(lines).encode("utf-8", errors="ignore")
+            bio = io.BytesIO(data)
+            bio.name = "unsecured_gateway_counts.txt"
+            await update.message.reply_document(document=bio, caption="Unsecured gateway summary")
+
+        # Final status message (single)
+        await _edit_or_reply(status_msg, summary + "\n\nFile scan finished ✅")
         return
 
     text = update.message.text or update.message.caption or ""
@@ -149,19 +248,24 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Send a website URL, or upload a .txt file with one site per line.")
         return
 
+    status_msg = await update.message.reply_text(
+        f"Checking {len(urls)} site(s)…",
+        disable_web_page_preview=True,
+    )
     scans = await _scan_urls(urls, analyzer)
     detected = [(u, r) for (u, r) in scans if _is_detected_gateway(r)]
+    summary = _build_summary(scans)
     if not detected:
-        await update.message.reply_text("No gateway detected (or only generic payment keywords).")
+        await _edit_or_reply(status_msg, f"{summary}\n\nNo gateway detected (or only generic payment keywords).")
         return
 
-    msg = "\n\n".join(_format_result(u, r) for u, r in detected[:10])
+    msg = summary + "\n\n" + "\n\n".join(_format_result(u, r) for u, r in detected[:10])
     if len(detected) > 10:
-        msg += f"\n\n(+{len(detected) - 10} more detected, upload as file for full output)"
-    await update.message.reply_text(msg, disable_web_page_preview=True)
+        msg += f"\n(+{len(detected) - 10} more detected; upload as file for full output)"
+    await _edit_or_reply(status_msg, msg)
 
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise SystemExit("Set env var TG_BOT_TOKEN.")
 
@@ -169,9 +273,11 @@ async def main():
     app.add_handler(MessageHandler(filters.ALL, _handle_message))
 
     print("Bot running...")
-    await app.run_polling(close_loop=False)
+    # run_polling manages its own event loop (don't wrap with asyncio.run)
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 
+                           
